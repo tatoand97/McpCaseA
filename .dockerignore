@@ -1,0 +1,9 @@
+.vs
+bin
+obj
+.git
+.gitignore
+*.user
+*.suo
+*.vsidx
+node_modules

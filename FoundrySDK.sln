@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.2.11415.280
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OrdersMcpAgent", "OrdersMcpAgent.csproj", "{C25F21BB-103B-48BF-D096-C832100C9AC0}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{C25F21BB-103B-48BF-D096-C832100C9AC0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C25F21BB-103B-48BF-D096-C832100C9AC0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C25F21BB-103B-48BF-D096-C832100C9AC0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C25F21BB-103B-48BF-D096-C832100C9AC0}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {026E459B-6EEA-4658-BCF4-AF1F33802E65}
+	EndGlobalSection
+EndGlobal
