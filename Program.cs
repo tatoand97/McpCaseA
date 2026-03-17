@@ -83,7 +83,7 @@ try
     Console.WriteLine($"McpServerUrl: {mcpServerUri}");
     Console.WriteLine($"AllowedTools: {RequiredToolName}");
 
-    await RunE2EValidationAsync(projectClient, agentName, mcpServerLabel);
+    RunE2EValidation(projectClient, agentName);
 }
 catch (ClientResultException ex)
 {
@@ -127,13 +127,8 @@ static void SetAllowedToolsByReflection(McpTool mcpTool, IReadOnlyList<string> t
     }
 
     string json = JsonSerializer.Serialize(new { tool_names = toolNames });
-    object? value = JsonSerializer.Deserialize(json, property.PropertyType);
-    if (value is null)
-    {
-        throw new InvalidOperationException("Unable to assign AllowedTools for MCP tool.");
-    }
-
-    property.SetValue(mcpTool, value);
+    object? value = JsonSerializer.Deserialize(json, property.PropertyType) ?? throw new InvalidOperationException("Unable to assign AllowedTools for MCP tool.");
+	property.SetValue(mcpTool, value);
 }
 
 static string BuildDefinitionSignature(AgentDefinition definition)
@@ -258,55 +253,22 @@ static async Task ValidateIdentityCanAccessProjectAsync(AIProjectClient projectC
     }
 }
 
-static async Task RunE2EValidationAsync(AIProjectClient projectClient, string agentName, string expectedServerLabel)
+static void RunE2EValidation(AIProjectClient projectClient, string agentName)
 {
-    ProjectResponsesClient responsesClient = projectClient.OpenAI.GetProjectResponsesClientForAgent(agentName);
+    ProjectResponsesClient client = projectClient.OpenAI.GetProjectResponsesClientForAgent(agentName);
 
-    CreateResponseOptions? nextResponseOptions = new(
-        [ResponseItem.CreateUserMessageItem("Use getOrderStatus for order ORD-1001 and return a short status summary.")]);
+    CreateResponseOptions options = new(
+    [
+        ResponseItem.CreateUserMessageItem(
+			"Usa la herramienta getOrderStatus para obtener el estado de la orden ORD-000001 y retorna un JSON con orderId, status y source.")
+    ]);
 
-    ResponseResult? latestResponse = null;
-    bool observedMcpApprovalRequest = false;
-    bool observedApprovedRequest = false;
-
-    while (nextResponseOptions is not null)
-    {
-        latestResponse = await responsesClient.CreateResponseAsync(nextResponseOptions);
-        nextResponseOptions = null;
-
-        foreach (ResponseItem responseItem in latestResponse.OutputItems)
-        {
-            if (responseItem is McpToolCallApprovalRequestItem approvalRequest)
-            {
-                observedMcpApprovalRequest = true;
-
-                bool approve = string.Equals(
-                    approvalRequest.ServerLabel,
-                    expectedServerLabel,
-                    StringComparison.Ordinal);
-
-                nextResponseOptions = new CreateResponseOptions
-                {
-                    PreviousResponseId = latestResponse.Id
-                };
-                nextResponseOptions.InputItems.Add(
-                    ResponseItem.CreateMcpApprovalResponseItem(
-                        approvalRequestId: approvalRequest.Id,
-                        approved: approve));
-
-                if (approve)
-                {
-                    observedApprovedRequest = true;
-                }
-            }
-        }
-    }
+    ResponseResult response = client.CreateResponse(options);
+    string outputText = response.GetOutputText();
 
     Console.WriteLine("E2EValidation: completed");
-    Console.WriteLine($"E2EResponseId: {latestResponse?.Id ?? "(none)"}");
-    Console.WriteLine($"E2EMcpApprovalRequestObserved: {observedMcpApprovalRequest}");
-    Console.WriteLine($"E2EMcpApproved: {observedApprovedRequest}");
-    Console.WriteLine($"E2EOutput: {latestResponse?.GetOutputText() ?? "(no output)"}");
+    Console.WriteLine($"E2EResponseId: {response.Id}");
+    Console.WriteLine($"E2EOutput: {outputText}");
     Console.WriteLine("APIM Checklist: verify operation=getOrderStatus, HTTP 200, and latency in APIM logs.");
 }
 
