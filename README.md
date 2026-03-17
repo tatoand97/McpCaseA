@@ -1,47 +1,45 @@
-# Orders MCP Client (Azure OpenAI Responses + ApiKey)
+# Orders MCP Agent (Foundry Agents + Responses)
 
-Console app que ejecuta un flujo **data-plane** con `Responses` usando:
-- `Azure.AI.OpenAI`
-- autenticacion por **ApiKey**
-- tool MCP declarada en cada request
+Console app que crea/actualiza un **Agent de la nueva experiencia de Foundry** usando:
+- `Azure.AI.Projects` (gestion de agente/versiones)
+- `Azure.AI.Projects.OpenAI` (Responses + MCP tool)
+- autenticacion **Entra ID** (sin API key)
 
 ## Que hace
 - Valida configuracion de forma fail-fast:
-  - `AZURE_OPENAI_ENDPOINT` debe ser un endpoint de recurso Azure OpenAI (`https://<resource>.openai.azure.com/`)
-  - `API_KEY` es obligatoria
+  - `PROJECT_ENDPOINT` debe ser de proyecto (`.../api/projects/...`)
   - `MCP_SERVER_URL` debe terminar en `/mcp`
+  - `MCP_SERVER_LABEL` debe coincidir con el label configurado para la tool MCP
   - `ALLOWED_TOOLS` debe incluir al menos una tool MCP valida
-- Ejecuta una llamada `Responses` contra `MODEL_DEPLOYMENT_NAME`
-- Inyecta en el request:
-  - `AGENT_INSTRUCTIONS`
+- Aplica reconciliacion idempotente por nombre (`AGENT_NAME`):
+  - si no existe: `created`
+  - si existe y coincide config: `unchanged`
+  - si existe con drift: `updated` (nueva version)
+- Configura MCP tool con:
   - `server_label`
   - `server_url`
   - `allowed_tools = [...]`
   - `require_approval = never`
-- Ejecuta una validacion E2E automatica que obliga el uso de tool MCP
-
-## Cambio funcional relevante
-- Ya no crea ni actualiza agentes de Foundry.
-- Ya no usa `AIProjectClient`, `PROJECT_ENDPOINT` ni `Managed Identity`.
-- `PROJECT_ENDPOINT` y `AGENT_NAME` quedan obsoletos y, si se configuran, solo generan advertencia.
+- Ejecuta validacion E2E automatica via Responses:
+  - envia prompt de prueba
+  - ejecuta la tool permitida sin aprobacion manual
 
 ## Requisitos
-- Recurso Azure OpenAI con API key valida.
-- Deployment existente en ese recurso (`MODEL_DEPLOYMENT_NAME`).
+- Rol de identidad: `Azure AI Developer` en el proyecto Foundry.
+- Modelo desplegado en el mismo proyecto (`MODEL_DEPLOYMENT_NAME`).
+- Endpoint de proyecto Foundry (no endpoint de Azure OpenAI recurso).
 - MCP server activo en APIM y expuesto en `/mcp`.
 
 ## appsettings.json
 ```json
 {
-  "AZURE_OPENAI_ENDPOINT": "https://<resource>.openai.azure.com/",
-  "API_KEY": "<api-key>",
+  "PROJECT_ENDPOINT": "https://<resource>.services.ai.azure.com/api/projects/<project>",
   "MODEL_DEPLOYMENT_NAME": "<deployment>",
   "MCP_SERVER_URL": "https://<apim-host>/<path>/mcp",
   "MCP_SERVER_LABEL": "orders-mcp",
+  "AGENT_NAME": "OrderAgent",
   "AGENT_INSTRUCTIONS": "You are an autonomous agent that manages orders using MCP tools. Use tools whenever a tool matches the user request and choose the correct tool from the decision rules.",
-  "ALLOWED_TOOLS": "createOrder, getOrder, getOrderStatus, updateOrder, cancelOrder",
-  "PROJECT_ENDPOINT": "",
-  "AGENT_NAME": ""
+  "ALLOWED_TOOLS": "createOrder, getOrder, getOrderStatus, updateOrder, cancelOrder"
 }
 ```
 
@@ -51,14 +49,14 @@ dotnet run --project OrdersMcpAgent.csproj
 ```
 
 ## Salida esperada
-- `ExecutionMode: api-key-responses`
-- `AzureOpenAIEndpoint`
-- `ModelDeploymentName`
-- `E2EValidation: completed`
-- `E2EResponseId`
-- `E2EOutput`
+- `ReconciliationStatus: created|updated|unchanged`
+- `AgentId`, `AgentName`, `AgentVersion`
+- Resultado E2E y `E2EOutput`
 
-## Verificacion en APIM
-1. Confirmar que se invoca una operacion incluida en `ALLOWED_TOOLS`.
-2. Confirmar latencia registrada.
-3. Confirmar HTTP `200`.
+## Verificacion en Foundry y APIM
+1. Foundry UI: `Build and customize -> Agents`
+2. Confirmar que aparece `AGENT_NAME` como agente nuevo.
+3. APIM logs:
+   - operacion invocada: una tool incluida en `ALLOWED_TOOLS`
+   - latencia registrada
+   - HTTP `200`
