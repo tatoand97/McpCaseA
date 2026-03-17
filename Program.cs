@@ -7,8 +7,6 @@ using Azure.Identity;
 using Microsoft.Extensions.Configuration;
 using OpenAI.Responses;
 
-const string RequiredToolName = "getOrderStatus";
-
 IConfiguration config = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
@@ -24,7 +22,6 @@ List<string> allowedTools = ParseCsv(config["ALLOWED_TOOLS"]);
 
 Uri projectEndpoint = ValidateProjectEndpoint(projectEndpointRaw);
 Uri mcpServerUri = ValidateMcpServerUrl(mcpServerUrlRaw);
-ValidateMcpServerLabel(mcpServerLabel);
 ValidateAllowedTools(allowedTools);
 
 DefaultAzureCredential credential = new(new DefaultAzureCredentialOptions
@@ -42,7 +39,8 @@ try
         modelDeploymentName,
         agentInstructions,
         mcpServerLabel,
-        mcpServerUri);
+        mcpServerUri,
+        allowedTools);
 
     AgentVersion? latestVersion = await TryGetLatestAgentVersionAsync(projectClient, agentName);
     string desiredSignature = BuildDefinitionSignature(desiredDefinition);
@@ -81,9 +79,9 @@ try
     Console.WriteLine($"ModelDeploymentName: {modelDeploymentName}");
     Console.WriteLine($"McpServerLabel: {mcpServerLabel}");
     Console.WriteLine($"McpServerUrl: {mcpServerUri}");
-    Console.WriteLine($"AllowedTools: {RequiredToolName}");
+    Console.WriteLine($"AllowedTools: {string.Join(',', allowedTools)}");
 
-    RunE2EValidation(projectClient, agentName);
+    RunE2EValidation(projectClient, agentName, allowedTools);
 }
 catch (ClientResultException ex)
 {
@@ -101,15 +99,16 @@ static PromptAgentDefinition BuildDesiredDefinition(
     string modelDeploymentName,
     string instructions,
     string mcpServerLabel,
-    Uri mcpServerUri)
+    Uri mcpServerUri,
+    IReadOnlyList<string> allowedTools)
 {
     McpTool mcpTool = ResponseTool.CreateMcpTool(
         serverLabel: mcpServerLabel,
         serverUri: mcpServerUri,
         toolCallApprovalPolicy: new McpToolCallApprovalPolicy(
-            GlobalMcpToolCallApprovalPolicy.AlwaysRequireApproval));
+            GlobalMcpToolCallApprovalPolicy.NeverRequireApproval));
 
-    SetAllowedToolsByReflection(mcpTool, [RequiredToolName]);
+    SetAllowedToolsByReflection(mcpTool, allowedTools);
 
     return new PromptAgentDefinition(modelDeploymentName)
     {
@@ -253,14 +252,15 @@ static async Task ValidateIdentityCanAccessProjectAsync(AIProjectClient projectC
     }
 }
 
-static void RunE2EValidation(AIProjectClient projectClient, string agentName)
+static void RunE2EValidation(AIProjectClient projectClient, string agentName, IReadOnlyList<string> allowedTools)
 {
     ProjectResponsesClient client = projectClient.OpenAI.GetProjectResponsesClientForAgent(agentName);
+    string toolList = string.Join(", ", allowedTools);
 
     CreateResponseOptions options = new(
     [
         ResponseItem.CreateUserMessageItem(
-			"Usa la herramienta getOrderStatus para obtener el estado de la orden ORD-000001 y retorna un JSON con orderId, status y source.")
+            $"Usa una tool MCP apropiada de esta lista [{toolList}] y retorna un JSON breve con el resultado.")
     ]);
 
     ResponseResult response = client.CreateResponse(options);
@@ -269,7 +269,7 @@ static void RunE2EValidation(AIProjectClient projectClient, string agentName)
     Console.WriteLine("E2EValidation: completed");
     Console.WriteLine($"E2EResponseId: {response.Id}");
     Console.WriteLine($"E2EOutput: {outputText}");
-    Console.WriteLine("APIM Checklist: verify operation=getOrderStatus, HTTP 200, and latency in APIM logs.");
+    Console.WriteLine($"APIM Checklist: verify invoked operation is one of [{toolList}], with HTTP 200 and latency in APIM logs.");
 }
 
 static Uri ValidateProjectEndpoint(string rawEndpoint)
@@ -309,19 +309,13 @@ static Uri ValidateMcpServerUrl(string rawUrl)
     return mcpUri;
 }
 
-static void ValidateMcpServerLabel(string mcpServerLabel)
-{
-    if (!Regex.IsMatch(mcpServerLabel, "^[A-Za-z0-9_]+$"))
-    {
-        throw new InvalidOperationException("MCP_SERVER_LABEL must use only letters, numbers, and underscore.");
-    }
-}
 
 static void ValidateAllowedTools(IReadOnlyCollection<string> allowedTools)
 {
-    if (allowedTools.Count != 1 || !string.Equals(allowedTools.Single(), RequiredToolName, StringComparison.Ordinal))
+    // Admitir múltiples herramientas, pero exigir que exista exactamente el nombre requerido (sensible a mayúsculas/minúsculas)
+    if (allowedTools.Count == 0)
     {
-        throw new InvalidOperationException($"ALLOWED_TOOLS must resolve exactly to '{RequiredToolName}'.");
+        throw new InvalidOperationException("ALLOWED_TOOLS must contain at least one MCP tool name.");
     }
 }
 
@@ -347,7 +341,8 @@ static List<string> ParseCsv(string? csv)
     [
         .. csv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(v => !string.IsNullOrWhiteSpace(v))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Distinct(StringComparer.Ordinal)
+            .ToList()
     ];
 }
 

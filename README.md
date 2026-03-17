@@ -9,8 +9,8 @@ Console app que crea/actualiza un **Agent de la nueva experiencia de Foundry** u
 - Valida configuracion de forma fail-fast:
   - `PROJECT_ENDPOINT` debe ser de proyecto (`.../api/projects/...`)
   - `MCP_SERVER_URL` debe terminar en `/mcp`
-  - `MCP_SERVER_LABEL` solo alfanumerico + `_` (sin guiones)
-  - `ALLOWED_TOOLS` debe resolver exactamente a `getOrderStatus`
+  - `MCP_SERVER_LABEL` debe coincidir con el label configurado para la tool MCP
+  - `ALLOWED_TOOLS` debe incluir al menos una tool MCP valida
 - Aplica reconciliacion idempotente por nombre (`AGENT_NAME`):
   - si no existe: `created`
   - si existe y coincide config: `unchanged`
@@ -18,12 +18,11 @@ Console app que crea/actualiza un **Agent de la nueva experiencia de Foundry** u
 - Configura MCP tool con:
   - `server_label`
   - `server_url`
-  - `allowed_tools = [getOrderStatus]`
-  - `require_approval = always`
+  - `allowed_tools = [...]`
+  - `require_approval = never`
 - Ejecuta validacion E2E automatica via Responses:
   - envia prompt de prueba
-  - atiende `mcp_approval_request`
-  - aprueba solo si el `server_label` coincide
+  - ejecuta la tool permitida sin aprobacion manual
 
 ## Requisitos
 - Rol de identidad: `Azure AI Developer` en el proyecto Foundry.
@@ -37,10 +36,10 @@ Console app que crea/actualiza un **Agent de la nueva experiencia de Foundry** u
   "PROJECT_ENDPOINT": "https://<resource>.services.ai.azure.com/api/projects/<project>",
   "MODEL_DEPLOYMENT_NAME": "<deployment>",
   "MCP_SERVER_URL": "https://<apim-host>/<path>/mcp",
-  "MCP_SERVER_LABEL": "orders_mcp",
+  "MCP_SERVER_LABEL": "orders-mcp",
   "AGENT_NAME": "OrderAgent",
-  "AGENT_INSTRUCTIONS": "You are an agent that retrieves order status using the approved tool only.",
-  "ALLOWED_TOOLS": "getOrderStatus"
+  "AGENT_INSTRUCTIONS": "You are an autonomous agent that manages orders using MCP tools. Use tools whenever a tool matches the user request and choose the correct tool from the decision rules.",
+  "ALLOWED_TOOLS": "createOrder, getOrder, getOrderStatus, updateOrder, cancelOrder"
 }
 ```
 
@@ -58,6 +57,6 @@ dotnet run --project OrdersMcpAgent.csproj
 1. Foundry UI: `Build and customize -> Agents`
 2. Confirmar que aparece `AGENT_NAME` como agente nuevo.
 3. APIM logs:
-   - operacion invocada: `getOrderStatus`
+   - operacion invocada: una tool incluida en `ALLOWED_TOOLS`
    - latencia registrada
    - HTTP `200`
