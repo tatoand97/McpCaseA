@@ -252,24 +252,123 @@ static async Task ValidateIdentityCanAccessProjectAsync(AIProjectClient projectC
     }
 }
 
-static void RunE2EValidation(AIProjectClient projectClient, string agentName, IReadOnlyList<string> allowedTools)
+static void RunE2EValidation(
+    AIProjectClient projectClient,
+    string agentName,
+    IReadOnlyList<string> allowedTools,
+    string? forcedTool = null)
 {
+    if (!string.IsNullOrWhiteSpace(forcedTool) &&
+        !allowedTools.Contains(forcedTool, StringComparer.Ordinal))
+    {
+        throw new InvalidOperationException($"Forced tool '{forcedTool}' is not present in ALLOWED_TOOLS.");
+    }
+
     ProjectResponsesClient client = projectClient.OpenAI.GetProjectResponsesClientForAgent(agentName);
     string toolList = string.Join(", ", allowedTools);
 
     CreateResponseOptions options = new(
     [
         ResponseItem.CreateUserMessageItem(
-            $"Usa una tool MCP apropiada de esta lista [{toolList}] y retorna un JSON breve con el resultado.")
-    ]);
+            $"Call exactly one MCP tool from this list [{toolList}] and return only the tool result.")
+    ])
+    {
+        ToolChoice = string.IsNullOrWhiteSpace(forcedTool)
+            ? ResponseToolChoice.CreateRequiredChoice()
+            : ResponseToolChoice.CreateFunctionChoice(forcedTool),
+        MaxToolCallCount = 1,
+        ParallelToolCallsEnabled = false
+    };
 
     ResponseResult response = client.CreateResponse(options);
     string outputText = response.GetOutputText();
+    (string Name, string Arguments, string Output, string Error) mcpCall =
+        ExtractSingleMcpToolCall(response, outputText, allowedTools, forcedTool);
 
     Console.WriteLine("E2EValidation: completed");
     Console.WriteLine($"E2EResponseId: {response.Id}");
+    Console.WriteLine($"E2EToolName: {mcpCall.Name}");
+    Console.WriteLine($"E2EToolArguments: {mcpCall.Arguments}");
+    Console.WriteLine($"E2EToolResult: {mcpCall.Output}");
+    if (!string.IsNullOrWhiteSpace(mcpCall.Error))
+    {
+        Console.WriteLine($"E2EToolError: {mcpCall.Error}");
+    }
     Console.WriteLine($"E2EOutput: {outputText}");
     Console.WriteLine($"APIM Checklist: verify invoked operation is one of [{toolList}], with HTTP 200 and latency in APIM logs.");
+}
+
+static (string Name, string Arguments, string Output, string Error) ExtractSingleMcpToolCall(
+    ResponseResult response,
+    string outputText,
+    IReadOnlyList<string> allowedTools,
+    string? forcedTool)
+{
+    using JsonDocument document = JsonDocument.Parse(BinaryData.FromObjectAsJson(response));
+
+    if (!document.RootElement.TryGetProperty("output", out JsonElement outputItems) ||
+        outputItems.ValueKind != JsonValueKind.Array)
+    {
+        throw new Exception($"E2E validation failed. Response '{response.Id}' does not contain an output array.");
+    }
+
+    List<(string Name, string Arguments, string Output, string Error)> mcpCalls = [];
+
+    foreach (JsonElement item in outputItems.EnumerateArray())
+    {
+        string itemType = ReadString(item, "type", "Type");
+        if (!string.Equals(itemType, "mcp_call", StringComparison.Ordinal))
+        {
+            continue;
+        }
+
+        string toolName = ReadString(item, "name", "Name");
+        string arguments = ReadRawJsonOrText(item, "arguments", "Arguments");
+        string result = ReadRawJsonOrText(item, "output", "Output");
+        string error = ReadRawJsonOrText(item, "error", "Error");
+
+        mcpCalls.Add((toolName, arguments, result, error));
+    }
+
+    if (mcpCalls.Count == 0)
+    {
+        throw new Exception(
+            $"E2E validation failed. Response '{response.Id}' did not invoke any MCP tool. OutputText: {outputText}");
+    }
+
+    if (mcpCalls.Count > 1)
+    {
+        throw new Exception(
+            $"E2E validation failed. Response '{response.Id}' invoked {mcpCalls.Count} MCP tools; expected exactly one.");
+    }
+
+    (string Name, string Arguments, string Output, string Error) mcpCall = mcpCalls[0];
+
+    if (string.IsNullOrWhiteSpace(mcpCall.Name))
+    {
+        throw new Exception($"E2E validation failed. Response '{response.Id}' contains an MCP call without a tool name.");
+    }
+
+    if (!allowedTools.Contains(mcpCall.Name, StringComparer.Ordinal))
+    {
+        throw new Exception(
+            $"E2E validation failed. Response '{response.Id}' invoked disallowed tool '{mcpCall.Name}'.");
+    }
+
+    if (!string.IsNullOrWhiteSpace(forcedTool) &&
+        !string.Equals(mcpCall.Name, forcedTool, StringComparison.Ordinal))
+    {
+        throw new Exception(
+            $"E2E validation failed. Response '{response.Id}' invoked '{mcpCall.Name}' instead of forced tool '{forcedTool}'.");
+    }
+
+    if (!string.IsNullOrWhiteSpace(mcpCall.Error))
+    {
+        throw new Exception(
+            $"E2E validation failed. Response '{response.Id}' returned MCP error for tool '{mcpCall.Name}': {mcpCall.Error}");
+    }
+
+    return mcpCall;
 }
 
 static Uri ValidateProjectEndpoint(string rawEndpoint)
@@ -354,6 +453,26 @@ static string ReadString(JsonElement element, params string[] candidates)
         {
             return property.GetString() ?? "";
         }
+    }
+
+    return "";
+}
+
+static string ReadRawJsonOrText(JsonElement element, params string[] candidates)
+{
+    foreach (string name in candidates)
+    {
+        if (!element.TryGetProperty(name, out JsonElement property))
+        {
+            continue;
+        }
+
+        return property.ValueKind switch
+        {
+            JsonValueKind.String => property.GetString() ?? "",
+            JsonValueKind.Undefined or JsonValueKind.Null => "",
+            _ => property.GetRawText()
+        };
     }
 
     return "";
