@@ -1,4 +1,6 @@
 using System.ClientModel;
+using System.Collections;
+using System.Globalization;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -45,15 +47,22 @@ try
 
     AgentVersion? latestVersion = await TryGetLatestAgentVersionAsync(projectClient, agentName);
     string desiredSignature = BuildDefinitionSignature(desiredDefinition);
+    string currentInstructions = latestVersion is null ? string.Empty : ReadDefinitionInstructions(latestVersion.Definition);
+
+    Console.WriteLine($"DesiredInstructions: {agentInstructions}");
+    Console.WriteLine($"CurrentInstructions: {currentInstructions}");
 
     AgentVersion effectiveVersion;
     string reconcileStatus;
 
     if (latestVersion is null)
     {
-        effectiveVersion = await projectClient.Agents.CreateAgentVersionAsync(
-            agentName: agentName,
-            options: new AgentVersionCreationOptions(desiredDefinition));
+        effectiveVersion = await CreateAndValidateAgentVersionAsync(
+            projectClient,
+            agentName,
+            desiredDefinition,
+            latestVersion,
+            agentInstructions);
         reconcileStatus = "created";
     }
     else
@@ -66,9 +75,12 @@ try
         }
         else
         {
-            effectiveVersion = await projectClient.Agents.CreateAgentVersionAsync(
-                agentName: agentName,
-                options: new AgentVersionCreationOptions(desiredDefinition));
+            effectiveVersion = await CreateAndValidateAgentVersionAsync(
+                projectClient,
+                agentName,
+                desiredDefinition,
+                latestVersion,
+                agentInstructions);
             reconcileStatus = "updated";
         }
     }
@@ -103,6 +115,9 @@ static PromptAgentDefinition BuildDesiredDefinition(
     Uri mcpServerUri,
     IReadOnlyList<string> allowedTools)
 {
+    string timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmssfff", CultureInfo.InvariantCulture);
+    string versionedInstructions = $"{instructions}\n\n#version:{timestamp}";
+
     McpTool mcpTool = ResponseTool.CreateMcpTool(
         serverLabel: mcpServerLabel,
         serverUri: mcpServerUri,
@@ -113,7 +128,7 @@ static PromptAgentDefinition BuildDesiredDefinition(
 
     return new PromptAgentDefinition(modelDeploymentName)
     {
-        Instructions = instructions,
+        Instructions = versionedInstructions,
         Tools = { mcpTool }
     };
 }
@@ -133,81 +148,35 @@ static void SetAllowedToolsByReflection(McpTool mcpTool, IReadOnlyList<string> t
 
 static string BuildDefinitionSignature(AgentDefinition definition)
 {
-    using JsonDocument document = JsonDocument.Parse(BinaryData.FromObjectAsJson(definition).ToString());
-
-    string model = ReadString(document.RootElement, "model", "Model");
-    string instructions = ReadString(document.RootElement, "instructions", "Instructions");
+    string model = NormalizeSignatureValue(ReadStringProperty(definition, "Model"));
+    string instructions = NormalizeInstructionsForSignature(ReadDefinitionInstructions(definition));
     string serverLabel = "";
     string serverUrl = "";
     string requireApproval = "";
     List<string> toolNames = [];
 
-    JsonElement tools = document.RootElement.TryGetProperty("tools", out JsonElement t1)
-        ? t1
-        : document.RootElement.TryGetProperty("Tools", out JsonElement t2)
-            ? t2
-            : default;
-
-    if (tools.ValueKind == JsonValueKind.Array)
+    foreach (object tool in ReadTools(definition))
     {
-        foreach (JsonElement tool in tools.EnumerateArray())
+        string toolType = NormalizeSignatureValue(ReadStringProperty(tool, "Type"));
+        bool isMcpTool =
+            string.Equals(toolType, "mcp", StringComparison.OrdinalIgnoreCase) ||
+            tool.GetType().Name.Contains("Mcp", StringComparison.OrdinalIgnoreCase);
+
+        if (!isMcpTool)
         {
-            string toolType = ReadString(tool, "type", "Type");
-            if (!string.Equals(toolType, "mcp", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            serverLabel = ReadString(tool, "server_label", "serverLabel", "ServerLabel");
-            serverUrl = ReadString(tool, "server_url", "serverUrl", "ServerUrl");
-
-            JsonElement allowed = tool.TryGetProperty("allowed_tools", out JsonElement a1)
-                ? a1
-                : tool.TryGetProperty("allowedTools", out JsonElement a2)
-                    ? a2
-                    : tool.TryGetProperty("AllowedTools", out JsonElement a3)
-                        ? a3
-                        : default;
-
-            JsonElement names = allowed.TryGetProperty("tool_names", out JsonElement n1)
-                ? n1
-                : allowed.TryGetProperty("toolNames", out JsonElement n2)
-                    ? n2
-                    : allowed.TryGetProperty("ToolNames", out JsonElement n3)
-                        ? n3
-                        : default;
-
-            if (names.ValueKind == JsonValueKind.Array)
-            {
-                toolNames = [.. names.EnumerateArray()
-                    .Where(e => e.ValueKind == JsonValueKind.String)
-                    .Select(e => e.GetString()!)
-                    .Where(v => !string.IsNullOrWhiteSpace(v))];
-            }
-
-            JsonElement approval = tool.TryGetProperty("require_approval", out JsonElement r1)
-                ? r1
-                : tool.TryGetProperty("requireApproval", out JsonElement r2)
-                    ? r2
-                    : tool.TryGetProperty("RequireApproval", out JsonElement r3)
-                        ? r3
-                        : default;
-
-            if (approval.ValueKind == JsonValueKind.Object)
-            {
-                if (approval.TryGetProperty("always", out _) || approval.TryGetProperty("Always", out _))
-                {
-                    requireApproval = "always";
-                }
-                else if (approval.TryGetProperty("never", out _) || approval.TryGetProperty("Never", out _))
-                {
-                    requireApproval = "never";
-                }
-            }
+            continue;
         }
-    }
 
-    toolNames = [.. toolNames.Order(StringComparer.Ordinal)];
+        serverLabel = NormalizeSignatureValue(ReadStringProperty(tool, "ServerLabel"));
+        serverUrl = NormalizeSignatureValue(ReadStringProperty(tool, "ServerUrl"));
+        requireApproval = NormalizeRequireApproval(ReadProperty(tool, "RequireApproval"));
+        toolNames = [.. ReadAllowedToolNames(tool)
+            .Select(NormalizeSignatureValue)
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)];
+        break;
+    }
 
     return JsonSerializer.Serialize(new
     {
@@ -221,6 +190,175 @@ static string BuildDefinitionSignature(AgentDefinition definition)
             requireApproval
         }
     });
+}
+
+static async Task<AgentVersion> CreateAndValidateAgentVersionAsync(
+    AIProjectClient projectClient,
+    string agentName,
+    PromptAgentDefinition desiredDefinition,
+    AgentVersion? latestVersion,
+    string desiredInstructions)
+{
+    AgentVersion createdVersion = await projectClient.Agents.CreateAgentVersionAsync(
+        agentName: agentName,
+        options: new AgentVersionCreationOptions(desiredDefinition));
+
+    AgentVersion fetchedVersion = await projectClient.Agents.GetAgentVersionAsync(
+        agentName: agentName,
+        agentVersion: createdVersion.Version);
+
+    string latestInstructions = latestVersion is null ? string.Empty : ReadDefinitionInstructions(latestVersion.Definition);
+    string createdInstructions = ReadDefinitionInstructions(fetchedVersion.Definition);
+    string expectedInstructions = desiredDefinition.Instructions ?? string.Empty;
+
+    Console.WriteLine($"DesiredInstructions: {desiredInstructions}");
+    Console.WriteLine($"CurrentInstructions: {latestInstructions}");
+    Console.WriteLine($"CreatedVersionInstructions: {createdInstructions}");
+
+    if (!string.Equals(
+        NormalizeInstructionsForComparison(createdInstructions),
+        NormalizeInstructionsForComparison(expectedInstructions),
+        StringComparison.Ordinal))
+    {
+        throw new InvalidOperationException(
+            $"The created agent version '{fetchedVersion.Version}' did not persist the expected instructions.");
+    }
+
+    return fetchedVersion;
+}
+
+static string ReadDefinitionInstructions(AgentDefinition definition)
+{
+    if (definition is PromptAgentDefinition promptDefinition)
+    {
+        return promptDefinition.Instructions ?? string.Empty;
+    }
+
+    return ReadStringProperty(definition, "Instructions");
+}
+
+static IEnumerable<object> ReadTools(AgentDefinition definition)
+{
+    if (ReadProperty(definition, "Tools") is not IEnumerable tools)
+    {
+        yield break;
+    }
+
+    foreach (object? tool in tools)
+    {
+        if (tool is not null)
+        {
+            yield return tool;
+        }
+    }
+}
+
+static IReadOnlyList<string> ReadAllowedToolNames(object tool)
+{
+    object? allowedTools = ReadProperty(tool, "AllowedTools");
+    if (allowedTools is null)
+    {
+        return [];
+    }
+
+    if (ReadProperty(allowedTools, "ToolNames") is IEnumerable names)
+    {
+        return [.. names.Cast<object>()
+            .Select(name => name?.ToString())
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!)];
+    }
+
+    return [];
+}
+
+static object? ReadProperty(object source, params string[] propertyNames)
+{
+    Type type = source.GetType();
+    foreach (string propertyName in propertyNames)
+    {
+        PropertyInfo? property = type.GetProperty(
+            propertyName,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+
+        if (property is not null)
+        {
+            return property.GetValue(source);
+        }
+    }
+
+    return null;
+}
+
+static string ReadStringProperty(object source, params string[] propertyNames)
+{
+    return ReadProperty(source, propertyNames)?.ToString() ?? string.Empty;
+}
+
+static string NormalizeInstructionsForSignature(string instructions)
+{
+    string withoutVersion = StripVersionSuffix(NormalizeLineEndings(instructions));
+    string[] lines = withoutVersion
+        .Split('\n')
+        .Select(line => Regex.Replace(line.Trim(), @"[ \t]+", " "))
+        .ToArray();
+
+    return string.Join('\n', lines).Trim();
+}
+
+static string NormalizeInstructionsForComparison(string instructions)
+{
+    return NormalizeLineEndings(instructions).Trim();
+}
+
+static string NormalizeSignatureValue(string value)
+{
+    return Regex.Replace(NormalizeLineEndings(value).Trim(), @"[ \t]+", " ");
+}
+
+static string NormalizeLineEndings(string value)
+{
+    return (value ?? string.Empty).Replace("\r\n", "\n").Replace('\r', '\n');
+}
+
+static string StripVersionSuffix(string instructions)
+{
+    return Regex.Replace(
+        instructions,
+        @"(?:\n){2}#version:[^\n]+\s*$",
+        string.Empty,
+        RegexOptions.CultureInvariant);
+}
+
+static string NormalizeRequireApproval(object? approval)
+{
+    if (approval is null)
+    {
+        return string.Empty;
+    }
+
+    if (ReadProperty(approval, "Always") is not null)
+    {
+        return "always";
+    }
+
+    if (ReadProperty(approval, "Never") is not null)
+    {
+        return "never";
+    }
+
+    string value = approval.ToString() ?? string.Empty;
+    if (value.Contains("Always", StringComparison.OrdinalIgnoreCase))
+    {
+        return "always";
+    }
+
+    if (value.Contains("Never", StringComparison.OrdinalIgnoreCase))
+    {
+        return "never";
+    }
+
+    return NormalizeSignatureValue(value);
 }
 
 static async Task<AgentVersion?> TryGetLatestAgentVersionAsync(AIProjectClient projectClient, string agentName)
@@ -341,8 +479,9 @@ static (string Name, string Arguments, string Output, string Error) ExtractSingl
 
     if (!allowedTools.Contains(mcpCall.Name, StringComparer.Ordinal))
     {
+        string availableTools = DescribeAdvertisedMcpTools(response);
         throw new Exception(
-            $"E2E validation failed. Response '{response.Id}' invoked disallowed tool '{mcpCall.Name}'.");
+            $"E2E validation failed. Response '{response.Id}' invoked disallowed tool '{mcpCall.Name}'. AdvertisedMcpTools: {availableTools}");
     }
 
     if (!string.IsNullOrWhiteSpace(forcedTool) &&
@@ -620,6 +759,57 @@ static string DescribeOutputItems(ResponseResult response)
     }
 
     return summaries.Count == 0 ? "(empty)" : string.Join("; ", summaries);
+}
+
+static string DescribeAdvertisedMcpTools(ResponseResult response)
+{
+    PropertyInfo? outputItemsProperty = response.GetType().GetProperty("OutputItems");
+    if (outputItemsProperty?.GetValue(response) is not System.Collections.IEnumerable outputItems)
+    {
+        return "(unavailable)";
+    }
+
+    List<string> toolNames = [];
+
+    foreach (object? item in outputItems)
+    {
+        if (item is null)
+        {
+            continue;
+        }
+
+        if (!item.GetType().Name.Contains("McpToolDefinitionListItem", StringComparison.OrdinalIgnoreCase))
+        {
+            continue;
+        }
+
+        PropertyInfo? toolDefinitionsProperty = item.GetType().GetProperty("ToolDefinitions");
+        if (toolDefinitionsProperty?.GetValue(item) is not System.Collections.IEnumerable toolDefinitions)
+        {
+            continue;
+        }
+
+        foreach (object? toolDefinition in toolDefinitions)
+        {
+            if (toolDefinition is null)
+            {
+                continue;
+            }
+
+            string toolName = ReadPropertyString(toolDefinition, "Name", "ToolName");
+            if (!string.IsNullOrWhiteSpace(toolName))
+            {
+                toolNames.Add(toolName);
+            }
+        }
+    }
+
+    if (toolNames.Count == 0)
+    {
+        return "(none)";
+    }
+
+    return string.Join(", ", toolNames.Distinct(StringComparer.Ordinal));
 }
 
 static string ReadPropertyString(object instance, params string[] propertyNames)
