@@ -1,4 +1,5 @@
 using System.ClientModel;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Azure.AI.Projects;
@@ -304,49 +305,38 @@ static (string Name, string Arguments, string Output, string Error) ExtractSingl
     IReadOnlyList<string> allowedTools,
     string? forcedTool)
 {
-    using JsonDocument document = JsonDocument.Parse(BinaryData.FromObjectAsJson(response));
-
-    if (!document.RootElement.TryGetProperty("output", out JsonElement outputItems) ||
-        outputItems.ValueKind != JsonValueKind.Array)
-    {
-        throw new Exception($"E2E validation failed. Response '{response.Id}' does not contain an output array.");
-    }
-
     List<(string Name, string Arguments, string Output, string Error)> mcpCalls = [];
 
-    foreach (JsonElement item in outputItems.EnumerateArray())
-    {
-        string itemType = ReadString(item, "type", "Type");
-        if (!string.Equals(itemType, "mcp_call", StringComparison.Ordinal))
-        {
-            continue;
-        }
-
-        string toolName = ReadString(item, "name", "Name");
-        string arguments = ReadRawJsonOrText(item, "arguments", "Arguments");
-        string result = ReadRawJsonOrText(item, "output", "Output");
-        string error = ReadRawJsonOrText(item, "error", "Error");
-
-        mcpCalls.Add((toolName, arguments, result, error));
-    }
+    CollectMcpCallsFromResponseItems(response, mcpCalls);
 
     if (mcpCalls.Count == 0)
     {
-        throw new Exception(
-            $"E2E validation failed. Response '{response.Id}' did not invoke any MCP tool. OutputText: {outputText}");
+        using JsonDocument document = JsonDocument.Parse(BinaryData.FromObjectAsJson(response));
+        CollectMcpCalls(document.RootElement, mcpCalls);
+
+        if (mcpCalls.Count == 0)
+        {
+            string payloadPreview = CreateJsonPreview(document.RootElement.GetRawText());
+            string outputItemsSummary = DescribeOutputItems(response);
+            throw new Exception(
+                $"E2E validation failed. Response '{response.Id}' did not invoke any MCP tool. OutputText: {outputText}. OutputItems: {outputItemsSummary}. SerializedResponse: {payloadPreview}");
+        }
     }
 
     if (mcpCalls.Count > 1)
     {
+        string outputItemsSummary = DescribeOutputItems(response);
         throw new Exception(
-            $"E2E validation failed. Response '{response.Id}' invoked {mcpCalls.Count} MCP tools; expected exactly one.");
+            $"E2E validation failed. Response '{response.Id}' invoked {mcpCalls.Count} MCP tools; expected exactly one. OutputItems: {outputItemsSummary}");
     }
 
     (string Name, string Arguments, string Output, string Error) mcpCall = mcpCalls[0];
 
     if (string.IsNullOrWhiteSpace(mcpCall.Name))
     {
-        throw new Exception($"E2E validation failed. Response '{response.Id}' contains an MCP call without a tool name.");
+        string outputItemsSummary = DescribeOutputItems(response);
+        throw new Exception(
+            $"E2E validation failed. Response '{response.Id}' contains an MCP call without a tool name. OutputItems: {outputItemsSummary}");
     }
 
     if (!allowedTools.Contains(mcpCall.Name, StringComparer.Ordinal))
@@ -449,7 +439,8 @@ static string ReadString(JsonElement element, params string[] candidates)
 {
     foreach (string name in candidates)
     {
-        if (element.TryGetProperty(name, out JsonElement property) && property.ValueKind == JsonValueKind.String)
+        if (TryGetPropertyInsensitive(element, name, out JsonElement property) &&
+            property.ValueKind == JsonValueKind.String)
         {
             return property.GetString() ?? "";
         }
@@ -462,7 +453,7 @@ static string ReadRawJsonOrText(JsonElement element, params string[] candidates)
 {
     foreach (string name in candidates)
     {
-        if (!element.TryGetProperty(name, out JsonElement property))
+        if (!TryGetPropertyInsensitive(element, name, out JsonElement property))
         {
             continue;
         }
@@ -476,6 +467,241 @@ static string ReadRawJsonOrText(JsonElement element, params string[] candidates)
     }
 
     return "";
+}
+
+static void CollectMcpCalls(
+    JsonElement element,
+    List<(string Name, string Arguments, string Output, string Error)> mcpCalls)
+{
+    switch (element.ValueKind)
+    {
+        case JsonValueKind.Object:
+            if (IsMcpCallElement(element))
+            {
+                string toolName = ReadString(element, "name", "Name");
+                string arguments = ReadRawJsonOrText(element, "arguments", "Arguments");
+                string result = ReadRawJsonOrText(element, "output", "Output", "result", "Result");
+                string error = ReadRawJsonOrText(element, "error", "Error");
+                mcpCalls.Add((toolName, arguments, result, error));
+                return;
+            }
+
+            foreach (JsonProperty property in element.EnumerateObject())
+            {
+                CollectMcpCalls(property.Value, mcpCalls);
+            }
+            break;
+
+        case JsonValueKind.Array:
+            foreach (JsonElement item in element.EnumerateArray())
+            {
+                CollectMcpCalls(item, mcpCalls);
+            }
+            break;
+    }
+}
+
+static void CollectMcpCallsFromResponseItems(
+    ResponseResult response,
+    List<(string Name, string Arguments, string Output, string Error)> mcpCalls)
+{
+    PropertyInfo? outputItemsProperty = response.GetType().GetProperty("OutputItems");
+    if (outputItemsProperty?.GetValue(response) is not System.Collections.IEnumerable outputItems)
+    {
+        return;
+    }
+
+    foreach (object? item in outputItems)
+    {
+        if (item is null)
+        {
+            continue;
+        }
+
+        string typeName = item.GetType().Name;
+        string itemType = ReadPropertyString(item, "Type");
+        bool typeLooksLikeCall = typeName.Contains("Call", StringComparison.OrdinalIgnoreCase);
+
+        bool looksLikeMcpCall =
+            (typeName.Contains("Mcp", StringComparison.OrdinalIgnoreCase) && typeLooksLikeCall) ||
+            string.Equals(itemType, "mcp_call", StringComparison.OrdinalIgnoreCase);
+
+        bool looksLikeFunctionCall =
+            typeName.Contains("FunctionCall", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(itemType, "function_call", StringComparison.OrdinalIgnoreCase);
+
+        if (!looksLikeMcpCall && !looksLikeFunctionCall)
+        {
+            continue;
+        }
+
+        string toolName = ReadPropertyString(item, "Name", "FunctionName", "ToolName", "ActionName");
+        string arguments = ReadPropertyValue(item, "ToolArguments", "Arguments", "FunctionArguments", "Parameters");
+        string result = ReadPropertyValue(item, "ToolOutput", "Output", "Result", "Content");
+        string error = ReadPropertyValue(item, "Error", "Failure");
+
+        mcpCalls.Add((toolName, arguments, result, error));
+    }
+}
+
+static bool IsMcpCallElement(JsonElement element)
+{
+    string itemType = ReadString(element, "type", "Type");
+    if (string.Equals(itemType, "mcp_call", StringComparison.OrdinalIgnoreCase))
+    {
+        return true;
+    }
+
+    if (string.Equals(itemType, "function_call", StringComparison.OrdinalIgnoreCase) &&
+        !string.IsNullOrWhiteSpace(ReadString(element, "name", "Name")))
+    {
+        return true;
+    }
+
+    return false;
+}
+
+static bool TryGetPropertyInsensitive(JsonElement element, string candidate, out JsonElement value)
+{
+    if (element.ValueKind == JsonValueKind.Object && element.TryGetProperty(candidate, out value))
+    {
+        return true;
+    }
+
+    if (element.ValueKind == JsonValueKind.Object)
+    {
+        foreach (JsonProperty property in element.EnumerateObject())
+        {
+            if (string.Equals(property.Name, candidate, StringComparison.OrdinalIgnoreCase))
+            {
+                value = property.Value;
+                return true;
+            }
+        }
+    }
+
+    value = default;
+    return false;
+}
+
+static string CreateJsonPreview(string json, int maxLength = 2000)
+{
+    if (json.Length <= maxLength)
+    {
+        return json;
+    }
+
+    return json[..maxLength] + "...";
+}
+
+static string DescribeOutputItems(ResponseResult response)
+{
+    PropertyInfo? outputItemsProperty = response.GetType().GetProperty("OutputItems");
+    if (outputItemsProperty?.GetValue(response) is not System.Collections.IEnumerable outputItems)
+    {
+        return "(unavailable)";
+    }
+
+    List<string> summaries = [];
+
+    foreach (object? item in outputItems)
+    {
+        if (item is null)
+        {
+            continue;
+        }
+
+        string typeName = item.GetType().FullName ?? item.GetType().Name;
+        string id = ReadPropertyString(item, "Id");
+        string itemType = ReadPropertyString(item, "Type");
+        string name = ReadPropertyString(item, "Name", "FunctionName", "ToolName", "ActionName");
+        string detail = DescribeObjectProperties(item);
+        summaries.Add($"{typeName}(Id={id},Type={itemType},Name={name},Properties={detail})");
+    }
+
+    return summaries.Count == 0 ? "(empty)" : string.Join("; ", summaries);
+}
+
+static string ReadPropertyString(object instance, params string[] propertyNames)
+{
+    foreach (string propertyName in propertyNames)
+    {
+        PropertyInfo? property = instance.GetType().GetProperty(propertyName);
+        if (property?.GetValue(instance) is string stringValue)
+        {
+            return stringValue;
+        }
+
+        if (property?.GetValue(instance) is BinaryData binaryData)
+        {
+            return binaryData.ToString();
+        }
+    }
+
+    return "";
+}
+
+static string ReadPropertyValue(object instance, params string[] propertyNames)
+{
+    foreach (string propertyName in propertyNames)
+    {
+        PropertyInfo? property = instance.GetType().GetProperty(propertyName);
+        if (property is null)
+        {
+            continue;
+        }
+
+        object? value = property.GetValue(instance);
+        if (value is null)
+        {
+            return "";
+        }
+
+        if (value is string stringValue)
+        {
+            return stringValue;
+        }
+
+        if (value is BinaryData binaryData)
+        {
+            return binaryData.ToString();
+        }
+
+        return JsonSerializer.Serialize(value);
+    }
+
+    return "";
+}
+
+static string DescribeObjectProperties(object instance)
+{
+    List<string> properties = [];
+
+    foreach (PropertyInfo property in instance.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+    {
+        object? value;
+        try
+        {
+            value = property.GetValue(instance);
+        }
+        catch
+        {
+            continue;
+        }
+
+        string renderedValue = value switch
+        {
+            null => "null",
+            string s => s,
+            BinaryData b => b.ToString(),
+            _ when value is System.Collections.IEnumerable && value is not string => value.GetType().Name,
+            _ => value.ToString() ?? ""
+        };
+
+        properties.Add($"{property.Name}={renderedValue}");
+    }
+
+    return string.Join(", ", properties);
 }
 
 static void WriteClientError(ClientResultException ex)

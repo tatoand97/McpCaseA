@@ -21,8 +21,12 @@ Console app que crea/actualiza un **Agent de la nueva experiencia de Foundry** u
   - `allowed_tools = [...]`
   - `require_approval = never`
 - Ejecuta validacion E2E automatica via Responses:
-  - envia prompt de prueba
-  - ejecuta la tool permitida sin aprobacion manual
+  - envia un prompt de validacion endurecido
+  - fuerza `tool_choice` en runtime
+  - limita la ejecucion a una sola tool call
+  - valida que la tool invocada pertenezca a `ALLOWED_TOOLS`
+  - falla si no ocurre una tool call valida
+  - registra `E2EToolName`, `E2EToolArguments`, `E2EToolResult` y `E2EOutput`
 
 ## Requisitos
 - Rol de identidad: `Azure AI Developer` en el proyecto Foundry.
@@ -38,7 +42,7 @@ Console app que crea/actualiza un **Agent de la nueva experiencia de Foundry** u
   "MCP_SERVER_URL": "https://<apim-host>/<path>/mcp",
   "MCP_SERVER_LABEL": "orders-mcp",
   "AGENT_NAME": "OrderAgent",
-  "AGENT_INSTRUCTIONS": "You are an autonomous agent that manages orders using MCP tools. Use tools whenever a tool matches the user request and choose the correct tool from the decision rules.",
+  "AGENT_INSTRUCTIONS": "You are an autonomous agent that manages orders using MCP tools. You must use MCP tools for every supported order operation. Do not answer with free text when a matching tool exists.",
   "ALLOWED_TOOLS": "createOrder, getOrder, getOrderStatus, updateOrder, cancelOrder"
 }
 ```
@@ -51,7 +55,19 @@ dotnet run --project OrdersMcpAgent.csproj
 ## Salida esperada
 - `ReconciliationStatus: created|updated|unchanged`
 - `AgentId`, `AgentName`, `AgentVersion`
-- Resultado E2E y `E2EOutput`
+- `E2EValidation: completed`
+- `E2EResponseId`
+- `E2EToolName`
+- `E2EToolArguments`
+- `E2EToolResult`
+- `E2EOutput`
+
+## Comportamiento E2E
+- La validacion E2E usa `ResponseToolChoice` para eliminar la decision del modelo sobre si debe usar tools.
+- Si se fuerza una tool especifica en runtime, la ejecucion falla si el modelo invoca una distinta.
+- Si la respuesta no contiene una tool call valida, la aplicacion lanza una excepcion.
+- Si la tool invocada no pertenece a `ALLOWED_TOOLS`, la aplicacion lanza una excepcion.
+- La reconciliacion del agente y la configuracion de la MCP tool no cambian por esta validacion.
 
 ## Verificacion en Foundry y APIM
 1. Foundry UI: `Build and customize -> Agents`
